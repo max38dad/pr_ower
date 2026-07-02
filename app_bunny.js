@@ -1,5 +1,4 @@
 const express = require("express");
-const { Agent } = require("undici");
 
 const APP_PORT = Number(process.env.PORT || 8080);
 const TARGET_HEADER = "x-target-url";
@@ -7,6 +6,10 @@ const TIMEOUT_HEADER = "x-proxy-timeout";
 const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_BODY_MB = 2;
 const VERIFY_TLS = false;
+
+if (!VERIFY_TLS) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -39,12 +42,6 @@ const RESPONSE_HEADERS_TO_DROP = new Set([
 const app = express();
 app.disable("x-powered-by");
 app.use(express.raw({ type: "*/*", limit: `${MAX_BODY_MB}mb` }));
-
-const upstreamDispatcher = new Agent({
-  connect: {
-    rejectUnauthorized: VERIFY_TLS,
-  },
-});
 
 function filterRequestHeaders(headers) {
   const forwarded = {};
@@ -116,7 +113,6 @@ async function getPublicIp() {
     const response = await fetch("https://api.ipify.org?format=json", {
       method: "GET",
       signal: withTimeoutSignal(DEFAULT_TIMEOUT_MS),
-      dispatcher: upstreamDispatcher,
     });
     if (!response.ok) {
       return "Sconosciuto";
@@ -165,7 +161,6 @@ app.all(["/", "/:path(*)"], async (req, res) => {
       body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
       redirect: "manual",
       signal: withTimeoutSignal(timeoutMs),
-      dispatcher: upstreamDispatcher,
     });
 
     applyResponseHeaders(res, upstreamResponse.headers);
