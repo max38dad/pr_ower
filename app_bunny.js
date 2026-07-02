@@ -132,20 +132,6 @@ async function containerInfo(req) {
   };
 }
 
-app.get("/healthz", (req, res) => {
-  res.status(200).json({ ok: true, status: "healthy" });
-});
-
-app.get("/ready", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    status: "ready",
-    max_body_mb: MAX_BODY_MB,
-    timeout_ms: DEFAULT_TIMEOUT_MS,
-    tls_verify: VERIFY_TLS,
-  });
-});
-
 app.all(["/", "/:path(*)"], async (req, res) => {
   const targetUrl = String(req.headers[TARGET_HEADER] || "").trim();
 
