@@ -1,9 +1,12 @@
 const express = require("express");
+const { Agent } = require("undici");
 
 const APP_PORT = Number(process.env.PORT || 8080);
 const TARGET_HEADER = "x-target-url";
-const CONNECT_TIMEOUT_MS = Number(process.env.PROXY_CONNECT_TIMEOUT || 5000);
-const READ_TIMEOUT_MS = Number(process.env.PROXY_READ_TIMEOUT || 20000);
+const TIMEOUT_HEADER = "x-proxy-timeout";
+const DEFAULT_TIMEOUT_MS = 5000;
+const MAX_BODY_MB = 2;
+const VERIFY_TLS = false;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -20,6 +23,7 @@ const REQUEST_HEADERS_TO_DROP = new Set([
   "host",
   "content-length",
   TARGET_HEADER,
+  TIMEOUT_HEADER,
   "x-real-ip",
   "true-client-ip",
   "cf-connecting-ip",
@@ -34,7 +38,13 @@ const RESPONSE_HEADERS_TO_DROP = new Set([
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.raw({ type: "*/*", limit: "25mb" }));
+app.use(express.raw({ type: "*/*", limit: `${MAX_BODY_MB}mb` }));
+
+const upstreamDispatcher = new Agent({
+  connect: {
+    rejectUnauthorized: VERIFY_TLS,
+  },
+});
 
 function filterRequestHeaders(headers) {
   const forwarded = {};
@@ -82,9 +92,48 @@ function requestMeta(req) {
   };
 }
 
-function withTimeoutSignal() {
-  const timeoutMs = CONNECT_TIMEOUT_MS + READ_TIMEOUT_MS;
+function resolveTimeoutMs(req) {
+  const headerValue = String(req.headers[TIMEOUT_HEADER] || "").trim();
+
+  if (!headerValue) {
+    return DEFAULT_TIMEOUT_MS;
+  }
+
+  const parsed = Number(headerValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_TIMEOUT_MS;
+  }
+
+  return Math.max(1, Math.round(parsed * 1000));
+}
+
+function withTimeoutSignal(timeoutMs) {
   return AbortSignal.timeout(timeoutMs);
+}
+
+async function getPublicIp() {
+  try {
+    const response = await fetch("https://api.ipify.org?format=json", {
+      method: "GET",
+      signal: withTimeoutSignal(DEFAULT_TIMEOUT_MS),
+      dispatcher: upstreamDispatcher,
+    });
+    if (!response.ok) {
+      return "Sconosciuto";
+    }
+    const payload = await response.json();
+    return payload && payload.ip ? String(payload.ip) : "Sconosciuto";
+  } catch {
+    return "Sconosciuto";
+  }
+}
+
+async function containerInfo(req) {
+  return {
+    message: "Bunny CDN Magic Container Proxy is Running!",
+    container_ip: await getPublicIp(),
+    headers_received: req.headers,
+  };
 }
 
 app.get("/healthz", (req, res) => {
@@ -95,28 +144,28 @@ app.get("/ready", (req, res) => {
   res.status(200).json({
     ok: true,
     status: "ready",
-    max_body_mb: 25,
-    timeout_ms: CONNECT_TIMEOUT_MS + READ_TIMEOUT_MS,
+    max_body_mb: MAX_BODY_MB,
+    timeout_ms: DEFAULT_TIMEOUT_MS,
+    tls_verify: VERIFY_TLS,
   });
 });
 
-app.all(/.*/, async (req, res) => {
+app.all(["/", "/:path(*)"], async (req, res) => {
   const targetUrl = String(req.headers[TARGET_HEADER] || "").trim();
 
   if (!targetUrl) {
-    return res.status(400).json({
-      ok: false,
-      error: "missing X-Target-Url header",
-    });
+    return res.status(200).json(await containerInfo(req));
   }
 
   try {
+    const timeoutMs = resolveTimeoutMs(req);
     const upstreamResponse = await fetch(targetUrl, {
       method: req.method,
       headers: filterRequestHeaders(req.headers),
       body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
       redirect: "manual",
-      signal: withTimeoutSignal(),
+      signal: withTimeoutSignal(timeoutMs),
+      dispatcher: upstreamDispatcher,
     });
 
     applyResponseHeaders(res, upstreamResponse.headers);
@@ -129,28 +178,8 @@ app.all(/.*/, async (req, res) => {
     const arrayBuffer = await upstreamResponse.arrayBuffer();
     return res.send(Buffer.from(arrayBuffer));
   } catch (error) {
-    if (error && error.name === "TimeoutError") {
-      return res.status(504).json({
-        ok: false,
-        error: "upstream timeout",
-        meta: requestMeta(req),
-      });
-    }
-
-    if (error && error.name === "AbortError") {
-      return res.status(504).json({
-        ok: false,
-        error: "upstream aborted",
-        meta: requestMeta(req),
-      });
-    }
-
-    return res.status(502).json({
-      ok: false,
-      error: "upstream request failed",
-      details: String(error && error.message ? error.message : error),
-      meta: requestMeta(req),
-    });
+    const errorMessage = String(error && error.message ? error.message : error);
+    return res.status(500).send(`Errore nel proxy: ${errorMessage}`);
   }
 });
 
