@@ -1,0 +1,16 @@
+{
+  "name": "bunny-proxy-js",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTTP proxy for Bunny Magic Containers",
+  "main": "app_bunny.js",
+  "scripts": {
+    "start": "node app_bunny.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
