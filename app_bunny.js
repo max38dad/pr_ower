@@ -57,8 +57,29 @@ setInterval(() => {
 }, 60000);
 
 // ============================================================
-// Headers
+// Keep-Alive Agent — reuse TCP+TLS connections to targets.
+// Without this, every request does a new handshake (150-300ms extra).
+// This is THE #1 fix for proxy throughput.
 // ============================================================
+const http = require("http");
+const https = require("https");
+
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 256,
+  maxFreeSockets: 64,
+  timeout: 30000,
+  rejectUnauthorized: VERIFY_TLS,
+});
+
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 256,
+  maxFreeSockets: 64,
+  timeout: 30000,
+});
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -180,6 +201,8 @@ async function proxyRequest(targetUrl, req, timeoutMs) {
         body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
         redirect: "manual",
         signal: withTimeoutSignal(timeoutMs),
+        // Use keep-alive agent: reuses TCP+TLS connections, eliminates handshake overhead
+        agent: targetUrl.startsWith("https") ? keepAliveAgent : httpAgent,
       });
 
       // If the response is a server error, retry with backoff
@@ -262,8 +285,13 @@ app.all(["/", "/:path(*)"], async (req, res) => {
       return res.end();
     }
 
-    const arrayBuffer = await upstreamResponse.arrayBuffer();
-    return res.send(Buffer.from(arrayBuffer));
+    // Stream the response instead of buffering — eliminates memory + latency overhead.
+    // ReadableStream (fetch) → Node.js Readable → Express res (writable)
+    const { Readable } = require("stream");
+    const nodeStream = Readable.fromWeb(upstreamResponse.body);
+    nodeStream.pipe(res);
+    nodeStream.on("error", () => { if (!res.headersSent) res.status(502).end("Proxy stream error"); });
+    return;
   } catch (error) {
     // Distinguish error types for better scanner feedback
     const isTimeout = error.name === "AbortError";
