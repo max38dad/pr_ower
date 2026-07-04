@@ -1,4 +1,7 @@
 const express = require("express");
+const http = require("http");
+const https = require("https");
+const { Readable } = require("stream");
 
 const APP_PORT = Number(process.env.PORT || 8080);
 const TARGET_HEADER = "x-target-url";
@@ -61,8 +64,6 @@ setInterval(() => {
 // Without this, every request does a new handshake (150-300ms extra).
 // This is THE #1 fix for proxy throughput.
 // ============================================================
-const http = require("http");
-const https = require("https");
 
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
@@ -265,13 +266,76 @@ async function containerInfo(req) {
 }
 
 // ============================================================
+// Stream response with proper error handling.
+// Uses Readable.fromWeb() (Node 17+) for zero-copy streaming.
+// Falls back to buffering if fromWeb is unavailable (Node 16).
+// ============================================================
+function streamResponse(upstreamResponse, res) {
+  if (!upstreamResponse.body) {
+    return res.end();
+  }
+
+  // Node 17+: use Readable.fromWeb for zero-copy streaming
+  if (typeof Readable.fromWeb === "function") {
+    try {
+      const nodeStream = Readable.fromWeb(upstreamResponse.body);
+
+      let destroyed = false;
+      function onError(err) {
+        if (destroyed) return;
+        destroyed = true;
+        console.error("Proxy stream error:", err && err.message ? err.message : err);
+        try { nodeStream.destroy(); } catch (_) {}
+        try { upstreamResponse.body.cancel?.(); } catch (_) {}
+        if (!res.headersSent) {
+          res.status(502).end("Proxy stream error");
+        } else {
+          // Headers already sent — must destroy socket to stop the response
+          try { res.socket?.destroy(); } catch (_) {}
+        }
+      }
+
+      nodeStream.on("error", onError);
+      res.on("error", onError);
+
+      nodeStream.pipe(res);
+      return;
+    } catch (err) {
+      console.error("Readable.fromWeb failed:", err.message, "- falling back to buffer");
+      // Fall through to buffer mode
+    }
+  }
+
+  // Fallback: buffer and send (Node 16 or fromWeb error)
+  upstreamResponse.arrayBuffer()
+    .then((buf) => {
+      if (!res.headersSent) {
+        res.send(Buffer.from(buf));
+      }
+    })
+    .catch((err) => {
+      console.error("Proxy buffer error:", err && err.message ? err.message : err);
+      if (!res.headersSent) {
+        res.status(502).end("Proxy stream error");
+      } else {
+        try { res.socket?.destroy(); } catch (_) {}
+      }
+    });
+}
+
+// ============================================================
 // Main route handler
 // ============================================================
 app.all(["/", "/:path(*)"], async (req, res) => {
   const targetUrl = String(req.headers[TARGET_HEADER] || "").trim();
 
   if (!targetUrl) {
-    return res.status(200).json(await containerInfo(req));
+    try {
+      const info = await containerInfo(req);
+      return res.status(200).json(info);
+    } catch {
+      return res.status(200).json({ message: "Bunny CDN Magic Container Proxy is Running!" });
+    }
   }
 
   try {
@@ -281,17 +345,7 @@ app.all(["/", "/:path(*)"], async (req, res) => {
     applyResponseHeaders(res, upstreamResponse.headers);
     res.status(upstreamResponse.status);
 
-    if (!upstreamResponse.body) {
-      return res.end();
-    }
-
-    // Stream the response instead of buffering — eliminates memory + latency overhead.
-    // ReadableStream (fetch) → Node.js Readable → Express res (writable)
-    const { Readable } = require("stream");
-    const nodeStream = Readable.fromWeb(upstreamResponse.body);
-    nodeStream.pipe(res);
-    nodeStream.on("error", () => { if (!res.headersSent) res.status(502).end("Proxy stream error"); });
-    return;
+    streamResponse(upstreamResponse, res);
   } catch (error) {
     // Distinguish error types for better scanner feedback
     const isTimeout = error.name === "AbortError";
@@ -311,6 +365,25 @@ app.all(["/", "/:path(*)"], async (req, res) => {
   }
 });
 
+// ============================================================
+// Graceful shutdown — clean up agents to avoid connection leaks
+// ============================================================
+function gracefulShutdown(signal) {
+  console.log(`Received ${signal}, shutting down...`);
+  try { keepAliveAgent.destroy(); } catch (_) {}
+  try { httpAgent.destroy(); } catch (_) {}
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Catch unhandled rejections — prevent container crash
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+  // Do NOT exit — log and continue
+});
+
 app.listen(APP_PORT, "0.0.0.0", () => {
-  console.log(`bunny proxy listening on ${APP_PORT} (retry=${MAX_RETRIES}, circuit_fail=${CIRCUIT_FAIL_THRESHOLD})`);
+  console.log(`bunny proxy listening on ${APP_PORT} (retry=${MAX_RETRIES}, circuit_fail=${CIRCUIT_FAIL_THRESHOLD}, stream=${typeof Readable.fromWeb === "function" ? "native" : "buffer"})`);
 });
