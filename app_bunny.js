@@ -156,16 +156,8 @@ app.all(["/", "/:path(*)"], async (req, res) => {
       return res.end();
     }
 
-    const { Readable } = require("stream");
-    const webStream = upstreamResponse.body;
-    const nodeStream = Readable.fromWeb(webStream);
-    
-    // Se lo scanner chiude la connessione (es. dopo 1MB), distruggi lo stream a monte
-    req.on("close", () => {
-        nodeStream.destroy();
-    });
-
-    nodeStream.pipe(res);
+    const arrayBuffer = await upstreamResponse.arrayBuffer();
+    return res.send(Buffer.from(arrayBuffer));
   } catch (error) {
     const errorMessage = String(error && error.message ? error.message : error);
     return res.status(500).send(`Errore nel proxy: ${errorMessage}`);
