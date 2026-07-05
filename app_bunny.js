@@ -6,7 +6,7 @@ const { Readable } = require("stream");
 const APP_PORT = Number(process.env.PORT || 8080);
 const TARGET_HEADER = "x-target-url";
 const TIMEOUT_HEADER = "x-proxy-timeout";
-const DEFAULT_TIMEOUT_MS = 500;
+const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_BODY_MB = 2;
 const VERIFY_TLS = false;
 
@@ -17,11 +17,11 @@ if (!VERIFY_TLS) {
 // ============================================================
 // Auto-scaling resilience — retry + backoff for cold targets
 // ============================================================
-const MAX_RETRIES = 1;
+const MAX_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 300;  // base delay, doubles each retry
 const RETRYABLE_STATUSES = new Set([500, 502, 503, 504]);
-const CIRCUIT_HALF_OPEN_MS = 5; // 15 sec before retrying a dead host
-const CIRCUIT_FAIL_THRESHOLD = 1;   // consecutive failures to open circuit
+const CIRCUIT_HALF_OPEN_MS = 5000; // 15 sec before retrying a dead host
+const CIRCUIT_FAIL_THRESHOLD = 2;   // consecutive failures to open circuit
 
 // Per-host circuit breaker state
 const circuitState = new Map(); // host -> { failures: number, openUntil: timestamp }
