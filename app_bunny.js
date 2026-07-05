@@ -326,7 +326,7 @@ function streamResponse(upstreamResponse, res) {
 // ============================================================
 // Main route handler
 // ============================================================
-app.all(["/", "/:path(*)"], async (req, res) => {
+app.all("*", async (req, res) => {
   const targetUrl = String(req.headers[TARGET_HEADER] || "").trim();
 
   if (!targetUrl) {
