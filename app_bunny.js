@@ -286,7 +286,6 @@ function streamResponse(upstreamResponse, res) {
         destroyed = true;
         console.error("Proxy stream error:", err && err.message ? err.message : err);
         try { nodeStream.destroy(); } catch (_) {}
-        try { upstreamResponse.body.cancel?.(); } catch (_) {}
         if (!res.headersSent) {
           res.status(502).end("Proxy stream error");
         } else {
