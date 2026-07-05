@@ -17,7 +17,7 @@ if (!VERIFY_TLS) {
 // ============================================================
 // Auto-scaling resilience — retry + backoff for cold targets
 // ============================================================
-const MAX_RETRIES = 0;
+const MAX_RETRIES = 1;
 const RETRY_BASE_DELAY_MS = 300;  // base delay, doubles each retry
 const RETRYABLE_STATUSES = new Set([500, 502, 503, 504]);
 const CIRCUIT_HALF_OPEN_MS = 5; // 15 sec before retrying a dead host
