@@ -1,388 +1,55 @@
-const express = require("express");
 const http = require("http");
-const https = require("https");
-const { Readable } = require("stream");
+const PORT = process.env.PORT || 8080;
 
-const APP_PORT = Number(process.env.PORT || 8080);
-const TARGET_HEADER = "x-target-url";
-const TIMEOUT_HEADER = "x-proxy-timeout";
-const DEFAULT_TIMEOUT_MS = 5000;
-const MAX_BODY_MB = 2;
-const VERIFY_TLS = false;
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-if (!VERIFY_TLS) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-}
-
-// ============================================================
-// Auto-scaling resilience — retry + backoff for cold targets
-// ============================================================
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 300;  // base delay, doubles each retry
-const RETRYABLE_STATUSES = new Set([500, 502, 503, 504]);
-const CIRCUIT_HALF_OPEN_MS = 6000; // 15 sec before retrying a dead host
-const CIRCUIT_FAIL_THRESHOLD = 5;   // consecutive failures to open circuit
-
-// Per-host circuit breaker state
-const circuitState = new Map(); // host -> { failures: number, openUntil: timestamp }
-
-function isCircuitOpen(host) {
-  const state = circuitState.get(host);
-  if (!state) return false;
-  if (state.openUntil > Date.now()) return true;
-  // Half-open: allow one probe
-  circuitState.delete(host);
-  return false;
-}
-
-function recordCircuitFailure(host) {
-  let state = circuitState.get(host);
-  if (!state) {
-    state = { failures: 0, openUntil: 0 };
-    circuitState.set(host, state);
-  }
-  state.failures++;
-  if (state.failures >= CIRCUIT_FAIL_THRESHOLD) {
-    state.openUntil = Date.now() + CIRCUIT_HALF_OPEN_MS;
-  }
-}
-
-function recordCircuitSuccess(host) {
-  circuitState.delete(host);
-}
-
-// Periodic cleanup of old circuit entries
-setInterval(() => {
-  const now = Date.now();
-  for (const [host, state] of circuitState) {
-    if (state.openUntil < now) circuitState.delete(host);
-  }
-}, 60000);
-
-// ============================================================
-// Keep-Alive Agent — reuse TCP+TLS connections to targets.
-// Without this, every request does a new handshake (150-300ms extra).
-// This is THE #1 fix for proxy throughput.
-// ============================================================
-
-const keepAliveAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 30000,
-  maxSockets: 256,
-  maxFreeSockets: 64,
-  timeout: 30000,
-  rejectUnauthorized: VERIFY_TLS,
-});
-
-const httpAgent = new http.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 30000,
-  maxSockets: 256,
-  maxFreeSockets: 64,
-  timeout: 30000,
-});
-
-const HOP_BY_HOP_HEADERS = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-]);
-
-const REQUEST_HEADERS_TO_DROP = new Set([
-  "host",
-  "content-length",
-  TARGET_HEADER,
-  TIMEOUT_HEADER,
-  "x-real-ip",
-  "true-client-ip",
-  "cf-connecting-ip",
-]);
-
-const RESPONSE_HEADERS_TO_DROP = new Set([
-  "content-encoding",
-  "content-length",
-  "transfer-encoding",
-  "connection",
-]);
-
-const app = express();
-app.disable("x-powered-by");
-app.use(express.raw({ type: "*/*", limit: `${MAX_BODY_MB}mb` }));
-
-// ============================================================
-// Health check — Bunny CDN uses this for readiness probes
-// CRITICAL for auto-scaling: responds immediately so Bunny
-// knows the container is ready to receive traffic.
-// ============================================================
-app.get("/healthz", (_req, res) => {
-  res.status(200).send("OK");
-});
-
-function filterRequestHeaders(headers) {
-  const forwarded = {};
-
-  for (const [key, value] of Object.entries(headers)) {
-    const normalized = key.toLowerCase();
-
-    if (HOP_BY_HOP_HEADERS.has(normalized)) continue;
-    if (REQUEST_HEADERS_TO_DROP.has(normalized)) continue;
-    if (normalized.startsWith("x-forwarded-")) continue;
-    if (normalized.startsWith("cdn-")) continue;
-    if (typeof value === "undefined") continue;
-
-    forwarded[key] = value;
+http.createServer(async (req, res) => {
+  // Bunny readiness probe
+  if (req.url === "/healthz") {
+    res.writeHead(200);
+    return res.end("OK");
   }
 
-  return forwarded;
-}
-
-function applyResponseHeaders(res, headers) {
-  for (const [key, value] of headers.entries()) {
-    const normalized = key.toLowerCase();
-    if (RESPONSE_HEADERS_TO_DROP.has(normalized)) continue;
-    res.setHeader(key, value);
+  const target = req.headers["x-target-url"];
+  if (!target) {
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, port: PORT }));
   }
-}
 
-function requestMeta(req) {
-  return {
-    method: req.method,
-    path: req.originalUrl,
-    remote_addr: req.headers["x-forwarded-for"] || req.socket.remoteAddress || null,
-  };
-}
-
-function resolveTimeoutMs(req) {
-  const headerValue = String(req.headers[TIMEOUT_HEADER] || "").trim();
-  if (!headerValue) return DEFAULT_TIMEOUT_MS;
-
-  const parsed = Number(headerValue);
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_TIMEOUT_MS;
-  return Math.max(1, Math.round(parsed * 1000));
-}
-
-function withTimeoutSignal(timeoutMs) {
-  return AbortSignal.timeout(timeoutMs);
-}
-
-function extractHost(urlString) {
   try {
-    return new URL(urlString).host;
-  } catch {
-    return null;
-  }
-}
+    const ms = (Number(req.headers["x-proxy-timeout"]) || 5) * 1000;
 
-// ============================================================
-// Core proxy with retry + circuit breaker
-// ============================================================
-async function proxyRequest(targetUrl, req, timeoutMs) {
-  const host = extractHost(targetUrl);
-
-  // Circuit breaker check
-  if (host && isCircuitOpen(host)) {
-    const err = new Error(`Circuit open for ${host}`);
-    err.status = 503;
-    err.circuitOpen = true;
-    throw err;
-  }
-
-  let lastError = null;
-
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      const response = await fetch(targetUrl, {
-        method: req.method,
-        headers: filterRequestHeaders(req.headers),
-        body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-        redirect: "manual",
-        signal: withTimeoutSignal(timeoutMs),
-        // Use keep-alive agent: reuses TCP+TLS connections, eliminates handshake overhead
-        agent: targetUrl.startsWith("https") ? keepAliveAgent : httpAgent,
-      });
-
-      // If the response is a server error, retry with backoff
-      if (RETRYABLE_STATUSES.has(response.status)) {
-        if (attempt < MAX_RETRIES - 1) {
-          const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-          await new Promise((r) => setTimeout(r, delay));
-          lastError = new Error(`Target returned ${response.status}`);
-          continue;
-        }
-        // Last attempt — return the error response as-is
-        if (host) recordCircuitFailure(host);
-      }
-
-      // Success
-      if (host) recordCircuitSuccess(host);
-      return response;
-
-    } catch (fetchError) {
-      lastError = fetchError;
-
-      // Don't retry on AbortError (timeout from our side)
-      if (fetchError.name === "AbortError") {
-        break;
-      }
-
-      // Retry on network errors
-      if (attempt < MAX_RETRIES - 1) {
-        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-        await new Promise((r) => setTimeout(r, delay));
-      }
+    // clona headers escludendo quelli interni
+    const h = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const n = k.toLowerCase();
+      if (n === "host" || n === "x-target-url" || n === "x-proxy-timeout" || n === "connection") continue;
+      h[k] = v;
     }
-  }
 
-  // All retries exhausted
-  if (host) recordCircuitFailure(host);
-  throw lastError;
-}
-
-async function getPublicIp() {
-  try {
-    const response = await fetch("https://api.ipify.org?format=json", {
-      method: "GET",
-      signal: withTimeoutSignal(DEFAULT_TIMEOUT_MS),
+    const noBody = req.method === "GET" || req.method === "HEAD";
+    const resp = await fetch(target, {
+      method: req.method,
+      headers: h,
+      body: noBody ? undefined : req,
+      signal: AbortSignal.timeout(ms),
     });
-    if (!response.ok) return "Sconosciuto";
-    const payload = await response.json();
-    return payload && payload.ip ? String(payload.ip) : "Sconosciuto";
-  } catch {
-    return "Sconosciuto";
-  }
-}
 
-async function containerInfo(req) {
-  return {
-    message: "Bunny CDN Magic Container Proxy is Running!",
-    container_ip: await getPublicIp(),
-    headers_received: req.headers,
-  };
-}
-
-// ============================================================
-// Stream response with proper error handling.
-// Uses Readable.fromWeb() (Node 17+) for zero-copy streaming.
-// Falls back to buffering if fromWeb is unavailable (Node 16).
-// ============================================================
-function streamResponse(upstreamResponse, res) {
-  if (!upstreamResponse.body) {
-    return res.end();
-  }
-
-  // Node 17+: use Readable.fromWeb for zero-copy streaming
-  if (typeof Readable.fromWeb === "function") {
-    try {
-      const nodeStream = Readable.fromWeb(upstreamResponse.body);
-
-      let destroyed = false;
-      function onError(err) {
-        if (destroyed) return;
-        destroyed = true;
-        console.error("Proxy stream error:", err && err.message ? err.message : err);
-        try { nodeStream.destroy(); } catch (_) {}
-        if (!res.headersSent) {
-          res.status(502).end("Proxy stream error");
-        } else {
-          // Headers already sent — must destroy socket to stop the response
-          try { res.socket?.destroy(); } catch (_) {}
-        }
-      }
-
-      nodeStream.on("error", onError);
-      res.on("error", onError);
-
-      nodeStream.pipe(res);
-      return;
-    } catch (err) {
-      console.error("Readable.fromWeb failed:", err.message, "- falling back to buffer");
-      // Fall through to buffer mode
+    // forward response headers
+    const rh = {};
+    for (const [k, v] of resp.headers) {
+      const n = k.toLowerCase();
+      if (n === "content-encoding" || n === "transfer-encoding" || n === "connection") continue;
+      rh[k] = v;
     }
-  }
+    res.writeHead(resp.status, rh);
 
-  // Fallback: buffer and send (Node 16 or fromWeb error)
-  upstreamResponse.arrayBuffer()
-    .then((buf) => {
-      if (!res.headersSent) {
-        res.send(Buffer.from(buf));
-      }
-    })
-    .catch((err) => {
-      console.error("Proxy buffer error:", err && err.message ? err.message : err);
-      if (!res.headersSent) {
-        res.status(502).end("Proxy stream error");
-      } else {
-        try { res.socket?.destroy(); } catch (_) {}
-      }
-    });
-}
-
-// ============================================================
-// Main route handler
-// ============================================================
-app.all("*", async (req, res) => {
-  const targetUrl = String(req.headers[TARGET_HEADER] || "").trim();
-
-  if (!targetUrl) {
-    try {
-      const info = await containerInfo(req);
-      return res.status(200).json(info);
-    } catch {
-      return res.status(200).json({ message: "Bunny CDN Magic Container Proxy is Running!" });
+    if (resp.body) {
+      for await (const chunk of resp.body) res.write(chunk);
     }
+    res.end();
+  } catch (err) {
+    res.writeHead(err.name === "AbortError" ? 504 : 502);
+    res.end(err.message || "proxy error");
   }
-
-  try {
-    const timeoutMs = resolveTimeoutMs(req);
-    const upstreamResponse = await proxyRequest(targetUrl, req, timeoutMs);
-
-    applyResponseHeaders(res, upstreamResponse.headers);
-    res.status(upstreamResponse.status);
-
-    streamResponse(upstreamResponse, res);
-  } catch (error) {
-    // Distinguish error types for better scanner feedback
-    const isTimeout = error.name === "AbortError";
-    const isCircuitOpen = error.circuitOpen === true;
-
-    if (isCircuitOpen) {
-      // 503 = service unavailable, scanner knows it's temporary
-      return res.status(503).send("Proxy temporaneamente non disponibile (circuit breaker attivo)");
-    }
-
-    if (isTimeout) {
-      return res.status(504).send(`Timeout nel proxy (${resolveTimeoutMs(req)}ms)`);
-    }
-
-    const errorMessage = String(error && error.message ? error.message : error);
-    return res.status(502).send(`Errore nel proxy: ${errorMessage}`);
-  }
-});
-
-// ============================================================
-// Graceful shutdown — clean up agents to avoid connection leaks
-// ============================================================
-function gracefulShutdown(signal) {
-  console.log(`Received ${signal}, shutting down...`);
-  try { keepAliveAgent.destroy(); } catch (_) {}
-  try { httpAgent.destroy(); } catch (_) {}
-  process.exit(0);
-}
-
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-
-// Catch unhandled rejections — prevent container crash
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason);
-  // Do NOT exit — log and continue
-});
-
-app.listen(APP_PORT, "0.0.0.0", () => {
-  console.log(`bunny proxy listening on ${APP_PORT} (retry=${MAX_RETRIES}, circuit_fail=${CIRCUIT_FAIL_THRESHOLD}, stream=${typeof Readable.fromWeb === "function" ? "native" : "buffer"})`);
-});
+}).listen(PORT, "0.0.0.0", () => console.log(`proxy ready :${PORT}`));
