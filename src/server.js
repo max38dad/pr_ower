@@ -2,7 +2,6 @@
 // Configures the HTTP server with all routes, hooks, and middleware.
 // Optimized for >10,000 RPS on Bunny Magic Containers.
 
-import { Readable } from 'node:stream';
 import Fastify from 'fastify';
 import { config } from './config.js';
 import { ProxyEngine } from './proxy.js';
@@ -46,25 +45,13 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
-  // ── Raw body capture via preParsing ──
-  // Capture the raw body BEFORE Fastify's content-type-parser touches it.
-  // We return a fresh Readable stream so Fastify's internal rawBody() can
-  // call .setEncoding() on it without errors.
-  // The raw Buffer is stored on request._rawBody for the proxy handler.
+  // ── Raw body: nuke Fastify's built-in parsers, register buffer catch-all ──
+  // Fastify v5's default application/json parser takes priority over '*'.
+  // We must explicitly remove it, then the '*' catch-all handles everything.
+  fastify.removeContentTypeParser('application/json');
+  fastify.removeContentTypeParser('text/plain');
+  fastify.removeContentTypeParser('application/x-www-form-urlencoded');
   fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
-
-  fastify.addHook('preParsing', async (request, _reply, payload) => {
-    if (BYPASS_PATHS.has(request.url)) return; // let health endpoints use defaults
-
-    const chunks = [];
-    for await (const chunk of payload) {
-      chunks.push(chunk);
-    }
-    request._rawBody = chunks.length > 0 ? Buffer.concat(chunks) : null;
-
-    // Return a fresh Readable stream — Fastify's internal rawBody() needs .setEncoding().
-    return request._rawBody ? Readable.from(request._rawBody) : payload;
-  });
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
@@ -180,11 +167,11 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: use raw body captured in preParsing hook.
+      // Body forwarding: request.body is a raw Buffer from our '*' parser.
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        body = request._rawBody || null;
+        try { body = await request.body; } catch { /* empty */ }
       }
 
       let result;
