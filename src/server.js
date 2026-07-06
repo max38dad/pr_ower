@@ -2,6 +2,7 @@
 // Configures the HTTP server with all routes, hooks, and middleware.
 // Optimized for >10,000 RPS on Bunny Magic Containers.
 
+import { Readable } from 'node:stream';
 import Fastify from 'fastify';
 import { config } from './config.js';
 import { ProxyEngine } from './proxy.js';
@@ -45,13 +46,25 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
-  // ── Raw body pass-through ──
-  // Register buffer parsers for common content types. Fastify's default JSON
-  // parser may still run first, but we read raw body directly from the stream
-  // in the proxy handler, completely bypassing Fastify's parser.
-  for (const ct of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data', '*']) {
-    fastify.addContentTypeParser(ct, { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
-  }
+  // ── Raw body capture via preParsing ──
+  // Capture the raw body BEFORE Fastify's content-type-parser touches it.
+  // We return a fresh Readable stream so Fastify's internal rawBody() can
+  // call .setEncoding() on it without errors.
+  // The raw Buffer is stored on request._rawBody for the proxy handler.
+  fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+
+  fastify.addHook('preParsing', async (request, _reply, payload) => {
+    if (BYPASS_PATHS.has(request.url)) return; // let health endpoints use defaults
+
+    const chunks = [];
+    for await (const chunk of payload) {
+      chunks.push(chunk);
+    }
+    request._rawBody = chunks.length > 0 ? Buffer.concat(chunks) : null;
+
+    // Return a fresh Readable stream — Fastify's internal rawBody() needs .setEncoding().
+    return request._rawBody ? Readable.from(request._rawBody) : payload;
+  });
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
@@ -167,20 +180,11 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: read directly from raw Node.js stream.
-      // This bypasses Fastify's content-type parser entirely, so we never
-      // hit FST_ERR_CTP_INVALID_JSON_BODY even if the default parser is active.
+      // Body forwarding: use raw body captured in preParsing hook.
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        try {
-          const raw = request.raw; // Node.js IncomingMessage — still has data if request.body wasn't accessed
-          const chunks = [];
-          for await (const chunk of raw) {
-            chunks.push(chunk);
-          }
-          if (chunks.length > 0) body = Buffer.concat(chunks);
-        } catch { /* empty */ }
+        body = request._rawBody || null;
       }
 
       let result;
