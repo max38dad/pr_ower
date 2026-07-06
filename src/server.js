@@ -45,11 +45,14 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
-  // ── Raw body pass-through (proxy must forward body untouched) ──
-  // Override every content-type parser to return raw Buffer, no parsing.
-  for (const ct of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data', '*']) {
-    fastify.addContentTypeParser(ct, { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+  // ── Raw body pass-through ──
+  // Fastify v5's default JSON parser cannot be overridden via addContentTypeParser.
+  // We must REMOVE the built-in parsers first, then register a catch-all.
+  // This ensures request.body is always a raw Buffer — no parsing at all.
+  for (const ct of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data']) {
+    try { fastify.removeContentTypeParser(ct); } catch { /* not registered */ }
   }
+  fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
@@ -165,17 +168,11 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: accept parsed or raw, normalize for undici.
+      // Body forwarding: request.body is always a raw Buffer (no parsing).
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        try {
-          const raw = await request.body;
-          if (raw != null) {
-            // Buffer → pass as-is. Object (JSON-parsed) → re-stringify for forwarding.
-            body = Buffer.isBuffer(raw) ? raw : typeof raw === 'object' ? JSON.stringify(raw) : raw;
-          }
-        } catch { /* empty */ }
+        try { body = await request.body; } catch { /* empty */ }
       }
 
       let result;
