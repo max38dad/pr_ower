@@ -16,7 +16,14 @@ function logMemory(tag) {
 }
 
 // ── Uncaught Error Handling ──
+// AbortError = client disconnected mid-response. Normal under load, do NOT crash.
+const NON_FATAL = new Set(['AbortError', 'ERR_STREAM_PREMATURE_CLOSE']);
+
 process.on('uncaughtException', (err) => {
+  if (NON_FATAL.has(err.name)) {
+    console.error('[WARN] non-fatal:', err.name, err.message);
+    return;
+  }
   console.error('[FATAL] uncaughtException:', err.message);
   console.error(err.stack);
   setTimeout(() => process.exit(1), 500).unref();

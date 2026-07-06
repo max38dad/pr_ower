@@ -168,32 +168,14 @@ export async function buildServer() {
         body = request.raw;
       }
 
+      let result;
       try {
-        const result = await proxyEngine.forward(target, {
+        result = await proxyEngine.forward(target, {
           headers: request.headers,
           method,
           body,
           requestId,
         });
-
-        reply.code(result.status);
-
-        // Forward response headers (strip hop-by-hop).
-        if (result.headers) {
-          for (const [key, value] of Object.entries(result.headers)) {
-            const lower = key.toLowerCase();
-            if (
-              lower === 'connection' ||
-              lower === 'keep-alive' ||
-              lower === 'transfer-encoding' ||
-              lower === 'content-length'
-            ) continue;
-            reply.header(key, value);
-          }
-        }
-
-        // Pipe response body as stream — zero buffering.
-        return result.body ? reply.send(result.body) : reply.send();
       } catch (err) {
         const code = err.code || '';
         const status =
@@ -212,6 +194,42 @@ export async function buildServer() {
           message: err.message,
           code: err.code,
         });
+      }
+
+      // If the client already disconnected, destroy the upstream body and bail.
+      if (request.raw.destroyed) {
+        result.body?.destroy();
+        return;
+      }
+
+      // When the client disconnects mid-stream, abort the upstream.
+      request.raw.once('close', () => {
+        result.body?.destroy();
+      });
+
+      reply.code(result.status);
+
+      // Forward response headers (strip hop-by-hop).
+      if (result.headers) {
+        for (const [key, value] of Object.entries(result.headers)) {
+          const lower = key.toLowerCase();
+          if (
+            lower === 'connection' ||
+            lower === 'keep-alive' ||
+            lower === 'transfer-encoding' ||
+            lower === 'content-length'
+          ) continue;
+          reply.header(key, value);
+        }
+      }
+
+      // Pipe response body as stream — zero buffering.
+      // reply.send() may throw AbortError if client disconnected; catch it.
+      try {
+        return result.body ? reply.send(result.body) : reply.send();
+      } catch (err) {
+        result.body?.destroy();
+        return;
       }
     },
   });
