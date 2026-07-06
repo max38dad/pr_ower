@@ -165,11 +165,17 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: get raw buffer (parser override returns buffer for all types).
+      // Body forwarding: accept parsed or raw, normalize for undici.
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        try { body = await request.body; } catch { /* empty or already consumed */ }
+        try {
+          const raw = await request.body;
+          if (raw != null) {
+            // Buffer → pass as-is. Object (JSON-parsed) → re-stringify for forwarding.
+            body = Buffer.isBuffer(raw) ? raw : typeof raw === 'object' ? JSON.stringify(raw) : raw;
+          }
+        } catch { /* empty */ }
       }
 
       let result;
