@@ -46,6 +46,7 @@ export async function buildServer() {
   globalThis.__gatewayLogger = fastify.log;
 
   // ── Proxy: forward body as raw bytes, never parse ──
+  fastify.removeAllContentTypeParsers();
   fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => {
     done(null, body);
   });
