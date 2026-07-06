@@ -45,19 +45,15 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
-  // ── Raw body: remove built-in parsers, add manual stream→Buffer parser ──
-  // We do NOT use { parseAs: 'buffer' } because it triggers Fastify's internal
-  // rawBody() which calls payload.setEncoding() and crashes on Bunny's runtime.
-  // Instead we consume the body stream manually.
+  // ── NO content-type parsers ──
+  // Bunny's container runtime does NOT provide standard Node.js streams,
+  // so any Fastify body parsing (rawBody → payload.setEncoding) crashes.
+  // We remove ALL built-in parsers and read body directly from request.raw
+  // in the proxy handler using for-await-of (works with any async iterable).
   fastify.removeContentTypeParser('application/json');
   fastify.removeContentTypeParser('text/plain');
   fastify.removeContentTypeParser('application/x-www-form-urlencoded');
-  fastify.addContentTypeParser('*', (_req, body, done) => {
-    const chunks = [];
-    body.on('data', (c) => chunks.push(c));
-    body.on('end', () => done(null, Buffer.concat(chunks)));
-    body.on('error', (e) => done(e));
-  });
+  fastify.removeContentTypeParser('multipart/form-data');
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
@@ -173,11 +169,18 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: request.body is a raw Buffer from our '*' parser.
+      // Body forwarding: read raw body from request.raw (async-iterable, works
+      // with any stream type — Node.js Readable, web ReadableStream, etc.).
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        try { body = await request.body; } catch { /* empty */ }
+        try {
+          const chunks = [];
+          for await (const chunk of request.raw) {
+            chunks.push(chunk);
+          }
+          if (chunks.length > 0) body = Buffer.concat(chunks);
+        } catch { /* no body or stream error — ok */ }
       }
 
       let result;
