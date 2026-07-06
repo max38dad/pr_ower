@@ -45,13 +45,19 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
-  // ── Raw body: nuke Fastify's built-in parsers, register buffer catch-all ──
-  // Fastify v5's default application/json parser takes priority over '*'.
-  // We must explicitly remove it, then the '*' catch-all handles everything.
+  // ── Raw body: remove built-in parsers, add manual stream→Buffer parser ──
+  // We do NOT use { parseAs: 'buffer' } because it triggers Fastify's internal
+  // rawBody() which calls payload.setEncoding() and crashes on Bunny's runtime.
+  // Instead we consume the body stream manually.
   fastify.removeContentTypeParser('application/json');
   fastify.removeContentTypeParser('text/plain');
   fastify.removeContentTypeParser('application/x-www-form-urlencoded');
-  fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+  fastify.addContentTypeParser('*', (_req, body, done) => {
+    const chunks = [];
+    body.on('data', (c) => chunks.push(c));
+    body.on('end', () => done(null, Buffer.concat(chunks)));
+    body.on('error', (e) => done(e));
+  });
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
