@@ -46,13 +46,12 @@ export async function buildServer() {
   globalThis.__gatewayLogger = fastify.log;
 
   // ── Raw body pass-through ──
-  // Fastify v5's default JSON parser cannot be overridden via addContentTypeParser.
-  // We must REMOVE the built-in parsers first, then register a catch-all.
-  // This ensures request.body is always a raw Buffer — no parsing at all.
-  for (const ct of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data']) {
-    try { fastify.removeContentTypeParser(ct); } catch { /* not registered */ }
+  // Register buffer parsers for common content types. Fastify's default JSON
+  // parser may still run first, but we read raw body directly from the stream
+  // in the proxy handler, completely bypassing Fastify's parser.
+  for (const ct of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data', '*']) {
+    fastify.addContentTypeParser(ct, { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
   }
-  fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
@@ -168,11 +167,20 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: request.body is always a raw Buffer (no parsing).
+      // Body forwarding: read directly from raw Node.js stream.
+      // This bypasses Fastify's content-type parser entirely, so we never
+      // hit FST_ERR_CTP_INVALID_JSON_BODY even if the default parser is active.
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        try { body = await request.body; } catch { /* empty */ }
+        try {
+          const raw = request.raw; // Node.js IncomingMessage — still has data if request.body wasn't accessed
+          const chunks = [];
+          for await (const chunk of raw) {
+            chunks.push(chunk);
+          }
+          if (chunks.length > 0) body = Buffer.concat(chunks);
+        } catch { /* empty */ }
       }
 
       let result;
