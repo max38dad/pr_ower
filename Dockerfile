@@ -1,12 +1,13 @@
-FROM node:20-alpine
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY app_bunny.js ./
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-ENV NODE_ENV=production
-ENV PORT=8080
+COPY app.py .
 
-EXPOSE 8080
+# Non forziamo l'EXPOSE a 8080, lasciamo che sia dinamico
+# EXPOSE 8080
 
-CMD ["node", "app_bunny.js"]
+CMD ["python", "app.py"]
