@@ -45,6 +45,11 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
+  // ── Proxy: forward body as raw bytes, never parse ──
+  fastify.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => {
+    done(null, body);
+  });
+
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
   const rateLimiter = new RateLimiter();
@@ -159,13 +164,11 @@ export async function buildServer() {
       const method = request.method;
       const requestId = request.id;
 
-      // Body forwarding: use request.raw (Node.js IncomingMessage) as stream.
-      // Fastify does NOT consume the body unless request.body is accessed,
-      // so request.raw is intact and positioned at the start of the body.
+      // Body forwarding: get raw buffer (parser override returns buffer for all types).
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
       let body = null;
       if (hasBody) {
-        body = request.raw;
+        try { body = await request.body; } catch { /* empty or already consumed */ }
       }
 
       let result;

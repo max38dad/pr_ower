@@ -21,7 +21,7 @@ const NON_FATAL = new Set(['AbortError', 'ERR_STREAM_PREMATURE_CLOSE']);
 
 process.on('uncaughtException', (err) => {
   if (NON_FATAL.has(err.name)) {
-    console.error('[WARN] non-fatal:', err.name, err.message);
+    // Client disconnected mid-response — normal under load. Silently ignore.
     return;
   }
   console.error('[FATAL] uncaughtException:', err.message);
