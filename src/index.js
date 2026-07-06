@@ -5,14 +5,21 @@
 import { config } from './config.js';
 import { buildServer } from './server.js';
 
-// ── Uncaught Error Handling ──
-// Catch-all to prevent crashes from taking down the container.
-// Log and let the orchestrator restart if needed.
+// ── Startup memory report (helps debug OOM) ──
+function logMemory(tag) {
+  const mem = process.memoryUsage();
+  console.log(
+    `[MEM ${tag}] rss=${Math.round(mem.rss / 1024 / 1024)}MB ` +
+    `heap=${Math.round(mem.heapUsed / 1024 / 1024)}/${Math.round(mem.heapTotal / 1024 / 1024)}MB ` +
+    `external=${Math.round(mem.external / 1024 / 1024)}MB`
+  );
+}
 
+// ── Uncaught Error Handling ──
 process.on('uncaughtException', (err) => {
-  console.error('[FATAL] uncaughtException:', err);
-  // Give time for logs to flush, then exit so the orchestrator restarts.
-  setTimeout(() => process.exit(1), 1000).unref();
+  console.error('[FATAL] uncaughtException:', err.message);
+  console.error(err.stack);
+  setTimeout(() => process.exit(1), 500).unref();
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -20,31 +27,34 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ── Graceful Shutdown ──
-// Bunny edge sends SIGTERM before killing the container.
-// We drain in-flight requests before exiting.
-
 async function gracefulShutdown(signal, fastify) {
-  console.log(`[SHUTDOWN] received ${signal}, draining...`);
-
-  // Stop accepting new requests.
+  console.log(`[SHUTDOWN] ${signal}, draining...`);
   try {
     await fastify.close();
+    console.log('[SHUTDOWN] complete');
   } catch (err) {
-    console.error('[SHUTDOWN] close error:', err);
-    process.exit(1);
+    console.error('[SHUTDOWN] error:', err.message);
   }
-
-  console.log('[SHUTDOWN] complete');
   process.exit(0);
 }
 
 // ── Bootstrap ──
-
 async function main() {
-  console.log(`[BOOT] Node.js ${process.version}`);
-  console.log(`[BOOT] Config: port=${config.port}, backends=${config.backends.length}, throttle=${config.throttle.enabled}`);
+  console.log(`[BOOT] Node.js ${process.version} | pid=${process.pid}`);
+  console.log(`[BOOT] port=${config.port} | throttling=${config.throttle.enabled} | rate_limit=${config.rateLimit.enabled}`);
+  logMemory('boot-start');
 
-  const { fastify } = await buildServer();
+  let fastify;
+  try {
+    const server = await buildServer();
+    fastify = server.fastify;
+  } catch (err) {
+    console.error('[FATAL] buildServer failed:', err.message);
+    console.error(err.stack);
+    process.exit(1);
+  }
+
+  logMemory('boot-built');
 
   // Wire OS signals.
   process.once('SIGTERM', () => gracefulShutdown('SIGTERM', fastify));
@@ -53,9 +63,13 @@ async function main() {
   try {
     await fastify.listen({ port: config.port, host: config.host });
   } catch (err) {
-    console.error('[FATAL] Failed to start server:', err);
+    console.error('[FATAL] listen failed:', err.message);
+    console.error(err.stack);
     process.exit(1);
   }
+
+  logMemory('boot-listening');
+  console.log('[BOOT] server listening — ready for traffic');
 }
 
 main();
