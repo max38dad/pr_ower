@@ -105,7 +105,6 @@ export class ProxyEngine {
         headers: opts.headers,
         body: opts.body,
         dispatcher: this.agent,
-        maxRedirections: this.maxRedirects,
         signal: opts.signal,
       });
 
