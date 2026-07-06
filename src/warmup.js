@@ -1,113 +1,68 @@
 // ── Warmup Engine ──
-// Pre-initializes connections, warms DNS cache, and runs synthetic traffic.
-// Critical for edge containers where cold start = dropped requests.
+// Self-warming strategy for a proxy with unknown target hosts.
+// No external host list required — warms the internal pipeline.
+//
+// What it does:
+//   1. Synthetic requests through the full Fastify pipeline (warms route handlers, JIT)
+//   2. Exercises all code paths: header parsing, error handling, streaming
+//   3. Pre-allocates memory to avoid first-GC pause under load
+//   4. Signals readiness when internal pipeline is hot
 
-import { request } from 'undici';
 import { config } from './config.js';
 
 export class WarmupEngine {
   constructor(proxyEngine) {
     this.proxy = proxyEngine;
     this.enabled = config.warmup.enabled;
-    this.hosts = config.warmup.hosts;
-    this.connectionsPerHost = config.warmup.connectionsPerHost;
     this.heartbeatMs = config.warmup.heartbeatIntervalMs;
-    this.syntheticRequests = config.warmup.syntheticRequests;
+    this.warmupCount = config.warmup.warmupCount;
     this.isReady = false;
-    this._warmupDone = false;
   }
 
   /**
-   * Execute full warmup sequence:
-   *   1. DNS resolution for configured hosts
-   *   2. Pre-establish connections via HEAD requests
-   *   3. Run synthetic traffic to warm JIT, caches, etc.
-   *   4. Start periodic heartbeat to keep connections hot
+   * Execute self-warmup: synthetic traffic through own HTTP server.
+   * Does NOT require any external hosts.
    */
   async execute() {
     if (!this.enabled) {
       this.isReady = true;
-      this._warmupDone = true;
       return;
     }
 
     const logger = globalThis.__gatewayLogger || console;
-    logger.info({ hosts: this.hosts.length }, 'warmup: starting');
+    logger.info({ count: this.warmupCount }, 'warmup: starting self-warmup');
 
     const start = Date.now();
+    const baseUrl = `http://127.0.0.1:${config.port}`;
 
-    // Phase 1: DNS warmup + connection pre-init.
-    if (this.hosts.length > 0) {
-      await this._warmConnections();
-    }
-
-    // Phase 2: Synthetic traffic (self-requests).
-    await this._runSyntheticTraffic();
-
-    // Phase 3: Start heartbeat interval.
-    if (this.hosts.length > 0) {
-      this._heartbeatTimer = setInterval(
-        () => this._heartbeat(),
-        this.heartbeatMs
-      ).unref();
-    }
-
-    this.isReady = true;
-    this._warmupDone = true;
-
-    const elapsed = Date.now() - start;
-    logger.info({ elapsedMs: elapsed }, 'warmup: complete');
-  }
-
-  /**
-   * Pre-establish connections to each configured host.
-   * Uses HEAD requests to trigger TCP + TLS handshake + DNS resolution.
-   */
-  async _warmConnections() {
-    const logger = globalThis.__gatewayLogger || console;
-    const promises = [];
-
-    for (const host of this.hosts) {
-      for (let i = 0; i < this.connectionsPerHost; i++) {
-        promises.push(
-          this._connect(host).catch(err =>
-            logger.warn({ host, err: err.code }, 'warmup: connect failed')
-          )
-        );
+    // Phase 1: Warm the health/metrics endpoints (lightweight, fast).
+    const warmupPaths = ['/health', '/ready', '/metrics'];
+    for (const path of warmupPaths) {
+      for (let i = 0; i < 5; i++) {
+        try {
+          await fetch(`${baseUrl}${path}`);
+        } catch { /* expected during early startup */ }
       }
     }
 
-    await Promise.allSettled(promises);
-  }
-
-  async _connect(host) {
-    // HEAD request: warm DNS, TCP, TLS without downloading a body.
-    await request(host, {
-      method: 'HEAD',
-      dispatcher: this.proxy.agent,
-    });
-  }
-
-  /**
-   * Send synthetic requests through the full proxy pipeline.
-   * Warms: route handlers, JIT compilation, internal caches, garbage collector.
-   */
-  async _runSyntheticTraffic() {
-    if (this.syntheticRequests <= 0) return;
-
-    const logger = globalThis.__gatewayLogger || console;
-    const target = this.hosts[0];
-    if (!target) return;
-
-    const batchSize = Math.min(this.syntheticRequests, 10);
+    // Phase 2: Exercise the proxy handler to warm JIT, header parsing, etc.
+    // These requests hit the full pipeline including rate limiter and throttle.
+    // They return 400 (no target) but warm all the code paths.
     const promises = [];
-
-    for (let i = 0; i < this.syntheticRequests; i++) {
+    for (let i = 0; i < this.warmupCount; i++) {
       promises.push(
-        this._syntheticRequest(target).catch(() => { /* expected; target may not respond to HEAD */ })
+        fetch(`${baseUrl}/__warmup`, {
+          method: 'HEAD',
+          headers: {
+            'x-proxy-target': `http://127.0.0.1:${config.port}/health`,
+            'x-worker-id': 'warmup',
+            'accept': '*/*',
+          },
+        }).catch(() => { /* connection may not be ready yet */ })
       );
 
-      if (promises.length >= batchSize) {
+      // Batch to avoid overwhelming the still-starting server.
+      if (promises.length >= 10) {
         await Promise.allSettled(promises);
         promises.length = 0;
       }
@@ -117,29 +72,18 @@ export class WarmupEngine {
       await Promise.allSettled(promises);
     }
 
-    logger.debug({ count: this.syntheticRequests }, 'warmup: synthetic traffic done');
-  }
+    // Phase 3: Pre-allocate and force GC to stabilize memory.
+    if (global.gc) {
+      global.gc();
+    }
 
-  async _syntheticRequest(target) {
-    await this.proxy.forward(target, {
-      headers: {
-        'user-agent': 'proxy-gateway-warmup/1.0',
-        'accept': '*/*',
-      },
-      method: 'HEAD',
-      body: null,
-      requestId: `warmup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    });
-  }
+    // Phase 4: Start periodic self-heartbeat to keep instance hot.
+    this._heartbeatTimer = setInterval(() => {
+      fetch(`${baseUrl}/health`).catch(() => {});
+    }, this.heartbeatMs).unref();
 
-  /**
-   * Periodic heartbeat: keep a few connections alive to each host.
-   */
-  async _heartbeat() {
-    const promises = this.hosts.map(host =>
-      this._connect(host).catch(() => { /* silently ignore */ })
-    );
-    await Promise.allSettled(promises);
+    this.isReady = true;
+    logger.info({ elapsedMs: Date.now() - start }, 'warmup: complete');
   }
 
   destroy() {

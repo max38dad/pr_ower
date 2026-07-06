@@ -70,12 +70,12 @@ export const config = {
   },
 
   // ── Warmup ──
+  // Self-warming: synthetic requests through own pipeline.
+  // No external hosts needed — warms JIT, route handlers, GC.
   warmup: {
     enabled: toBool(process.env.WARMUP_ENABLED, true),
-    hosts: toList(process.env.WARMUP_HOSTS),
-    connectionsPerHost: toInt(process.env.WARMUP_CONNECTIONS, 8),
+    warmupCount: toInt(process.env.WARMUP_COUNT, 50),
     heartbeatIntervalMs: toInt(process.env.WARMUP_HEARTBEAT_MS, 20_000),
-    syntheticRequests: toInt(process.env.WARMUP_SYNTHETIC_REQUESTS, 30),
   },
 
   // ── Load-Balanced Backends (comma-separated URLs) ──
