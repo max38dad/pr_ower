@@ -45,17 +45,11 @@ export async function buildServer() {
   // Expose logger globally for warmup engine.
   globalThis.__gatewayLogger = fastify.log;
 
-  // ── Proxy: intercept body BEFORE any parser touches it ──
-  // Fastify's default JSON parser rejects non-JSON bodies. For a proxy,
-  // the body must pass through untouched. preParsing runs before any parser.
-  fastify.addHook('preParsing', async (_request, _reply, payload) => {
-    if (!payload) return payload;
-    const chunks = [];
-    for await (const chunk of payload) {
-      chunks.push(chunk);
-    }
-    return Buffer.concat(chunks);
-  });
+  // ── Raw body pass-through (proxy must forward body untouched) ──
+  // Override every content-type parser to return raw Buffer, no parsing.
+  for (const ct of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data', '*']) {
+    fastify.addContentTypeParser(ct, { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+  }
 
   // ── Core Services ──
   const proxyEngine = new ProxyEngine();
