@@ -14,7 +14,8 @@ const HOP_HEADERS = new Set([
 
 // ── Internal headers (not forwarded) ──
 const INTERNAL_HEADERS = new Set([
-  'x-proxy-target', 'x-worker-id', 'x-affinity-key',
+  'x-target-url', 'x-proxy-target', 'x-proxy-timeout',
+  'x-worker-id', 'x-affinity-key',
   'x-request-id', 'x-forwarded-for', 'x-forwarded-proto',
 ]);
 
@@ -175,21 +176,26 @@ export class ProxyEngine {
   /**
    * Parse the target URL from request headers or query.
    * Supports:
-   *   - X-Proxy-Target header (preferred)
-   *   - ?url= query param
+   *   - X-Target-Url header (Go BunnyProxyTransport sends this)
+   *   - X-Proxy-Target header (manual/legacy)
+   *   - ?url= query param (fallback)
    *   - Load-balanced backend (configured in env)
    */
   static extractTarget(headers, query, loadBalancer) {
-    // 1. Explicit target header.
-    let target = headers['x-proxy-target'];
+    // 1. Go scraper header (BunnyProxyTransport).
+    let target = headers['x-target-url'];
     if (target) return target;
 
-    // 2. URL query param fallback.
+    // 2. Legacy/manual header.
+    target = headers['x-proxy-target'];
+    if (target) return target;
+
+    // 3. URL query param fallback.
     if (query && query.url) {
       return query.url;
     }
 
-    // 3. Load-balanced backend.
+    // 4. Load-balanced backend.
     if (loadBalancer && loadBalancer.ready) {
       const affinityKey = headers['x-affinity-key'] || null;
       return loadBalancer.pick(affinityKey);

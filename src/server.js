@@ -17,7 +17,7 @@ import {
 } from './health.js';
 
 // Paths that bypass rate limiting and throttle (internal health checks).
-const BYPASS_PATHS = new Set(['/health', '/ready', '/metrics', '/warmup']);
+const BYPASS_PATHS = new Set(['/health', '/healthz', '/ready', '/metrics', '/warmup']);
 
 export async function buildServer() {
   // ── Fastify instance ──
@@ -123,6 +123,7 @@ export async function buildServer() {
   // ── Routes ──
 
   fastify.get('/health', healthHandler);
+  fastify.get('/healthz', healthHandler);  // Go BunnyProxyTransport warmup expects this
   fastify.get('/ready', readinessHandler);
   fastify.get('/metrics', metricsHandler);
 
